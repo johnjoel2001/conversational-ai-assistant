@@ -1,0 +1,7 @@
+boto3
+flask
+pytest
+pytest-mock
+
+
+
