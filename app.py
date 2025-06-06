@@ -1,31 +1,24 @@
 # app.py
 
-import json
 from flask import Flask, request, jsonify
 from bedrock_client import BedrockClient
-from memory import Memory
 from errors import ConfigurationError, BedrockInvocationError
 
 app = Flask(__name__)
-global_memory = Memory()
-history = []
-MAX_CONTEXT_TURNS = 3
 
-def build_prompt(history, memory_obj):
+def build_prompt_single_turn(user_input: str) -> str:
     """
-    Combine memory text + last few turns into one string ending with "Assistant:".
+    Build a prompt that:
+      1) Issues a SYSTEM instruction to be concise.
+      2) Presents exactly "User: <input>" with no history.
+      3) Ends with "Assistant:" so the model knows to reply.
     """
-    lines = []
-    mem_text = memory_obj.to_prompt()
-    if mem_text:
-        lines.append(mem_text)
-
-    limited = history[-(MAX_CONTEXT_TURNS * 2):]
-    for role, text in limited:
-        prefix = "User:" if role == "user" else "Assistant:"
-        lines.append(f"{prefix} {text}")
-
-    lines.append("Assistant:")
+    lines = [
+        "System: Respond ONLY with the assistant’s direct reply to the user message. "
+        "Do NOT include any previous conversation or extra commentary.",
+        f"User: {user_input}",
+        "Assistant:"
+    ]
     return "\n".join(lines)
 
 @app.route("/chat", methods=["POST"])
@@ -38,27 +31,29 @@ def chat_endpoint():
     if not user_input:
         return jsonify({"error": "Message cannot be empty."}), 400
 
-    global_memory.parse_and_store(user_input)
-    history.append(("user", user_input))
-
-    prompt_text = build_prompt(history, global_memory)
+    # Build the single-turn prompt
+    prompt_text = build_prompt_single_turn(user_input)
 
     try:
         bedrock = BedrockClient()
-        reply = bedrock.invoke(prompt_text)
+        reply = bedrock.invoke(
+            prompt_text,
+            max_gen_len=512,
+            temperature=0.5,
+            top_p=0.9
+        )
     except ConfigurationError as ce:
         return jsonify({"error": f"Configuration error: {ce}"}), 500
     except BedrockInvocationError as be:
-        return jsonify({"error": f"Bedrock invocation failed: {be}"}), 502
+        return jsonify({"error": f"Llama invocation failed: {be}"}), 502
 
-    history.append(("assistant", reply))
     return jsonify({"reply": reply})
 
 @app.route("/", methods=["GET"])
 def index():
     return (
-        "<h3>Assistant is running.</h3>"
-        "<p>Send POST to <code>/chat</code> with JSON { 'message':'…' }.</p>"
+        "<h3>Llama 3.3 70B Instruct is running.</h3>"
+        "<p>POST JSON { 'message': '…' } to <code>/chat</code>.</p>"
     )
 
 if __name__ == "__main__":
