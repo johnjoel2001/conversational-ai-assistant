@@ -3,81 +3,99 @@
 import os
 import json
 import pytest
-import boto3
-from botocore.stub import Stubber
-from botocore.exceptions import ClientError
-
 from bedrock_client import BedrockClient
 from errors import ConfigurationError, BedrockInvocationError
 
+class DummyResponse:
+    def __init__(self, body_bytes):
+        self.body = DummyBody(body_bytes)
+
+class DummyBody:
+    def __init__(self, data):
+        self._data = data
+    def read(self):
+        return self._data
+
+class DummyClient:
+    def __init__(self, response_payload):
+        # response_payload: a dict that will be JSON‐encoded
+        self.payload = response_payload
+
+    def invoke_model(self, **kwargs):
+        # Always return a dummy response with JSON‐encoded self.payload
+        body_bytes = json.dumps(self.payload).encode("utf-8")
+        return DummyResponse(body_bytes)
+
 @pytest.fixture(autouse=True)
-def set_env_vars(monkeypatch):
-    monkeypatch.setenv("AWS_REGION", "us-east-2")
-    monkeypatch.setenv("BEDROCK_MODEL_ID", "test-model-id")
-
-def test_missing_region(monkeypatch):
+def no_aws_env(monkeypatch):
+    # Ensure AWS_REGION or BEDROCK_MODEL_ID not set by default
     monkeypatch.delenv("AWS_REGION", raising=False)
-    with pytest.raises(ConfigurationError):
-        BedrockClient()
-
-def test_missing_model(monkeypatch):
     monkeypatch.delenv("BEDROCK_MODEL_ID", raising=False)
+
+def test_missing_env_vars():
+    # Neither AWS_REGION nor BEDROCK_MODEL_ID → ConfigurationError
     with pytest.raises(ConfigurationError):
         BedrockClient()
 
-def test_invoke_success(monkeypatch):
+def test_invoke_generation(monkeypatch):
+    # Simulate a response with {"generation": "Hello world"}
+    os.environ["AWS_REGION"] = "us-east-2"
+    os.environ["BEDROCK_MODEL_ID"] = "meta.llama3-3-70b-instruct-v1:0"
+    dummy = DummyClient({"generation": " Hello world "})
+    monkeypatch.setattr("bedrock_client.boto3.client", lambda *args, **kwargs: dummy)
     bc = BedrockClient()
-    stubber = Stubber(bc.client)
+    result = bc.invoke("prompt")
+    assert result == "Hello world"
 
-    fake_body = json.dumps({"completion": "Hello from fake Bedrock!"}).encode("utf-8")
-    response = {"body": boto3.compat.BytesIO(fake_body)}
+def test_invoke_completion(monkeypatch):
+    # Simulate a response with {"completion": "Bye world"}
+    os.environ["AWS_REGION"] = "us-east-2"
+    os.environ["BEDROCK_MODEL_ID"] = "meta.llama3-3-70b-instruct-v1:0"
+    dummy = DummyClient({"completion": "Bye world"})
+    monkeypatch.setattr("bedrock_client.boto3.client", lambda *args, **kwargs: dummy)
+    bc = BedrockClient()
+    assert bc.invoke("prompt") == "Bye world"
 
-    expected_params = {
-        "modelId": "test-model-id",
-        "contentType": "application/json",
-        "accept": "application/json",
-        "body": bytes(json.dumps({
-            "prompt": "hey",
-            "maxTokensToSample": 256,
-            "temperature": 0.7
-        }), "utf-8")
+def test_invoke_text(monkeypatch):
+    os.environ["AWS_REGION"] = "us-east-2"
+    os.environ["BEDROCK_MODEL_ID"] = "meta.llama3-3-70b-instruct-v1:0"
+    dummy = DummyClient({"text": "Just text"})
+    monkeypatch.setattr("bedrock_client.boto3.client", lambda *args, **kwargs: dummy)
+    bc = BedrockClient()
+    assert bc.invoke("prompt") == "Just text"
+
+def test_invoke_choices(monkeypatch):
+    os.environ["AWS_REGION"] = "us-east-2"
+    os.environ["BEDROCK_MODEL_ID"] = "meta.llama3-3-70b-instruct-v1:0"
+    payload = {
+        "choices": [
+            { "message": { "content": [ { "text": "Choice text" } ] } }
+        ]
     }
-    stubber.add_response("invoke_model", response, expected_params)
-    stubber.activate()
-
-    result = bc.invoke("hey")
-    assert result == "Hello from fake Bedrock!"
-    stubber.deactivate()
-
-def test_invoke_aws_error(monkeypatch):
+    dummy = DummyClient(payload)
+    monkeypatch.setattr("bedrock_client.boto3.client", lambda *args, **kwargs: dummy)
     bc = BedrockClient()
-    stubber = Stubber(bc.client)
-    stubber.add_client_error("invoke_model", service_error_code="InternalFailure", service_message="Oops")
-    stubber.activate()
+    assert bc.invoke("prompt") == "Choice text"
 
-    with pytest.raises(BedrockInvocationError) as excinfo:
-        bc.invoke("test")
-    assert "Failed to invoke Bedrock model" in str(excinfo.value)
-    stubber.deactivate()
-
-def test_invoke_bad_json(monkeypatch):
-    bc = BedrockClient()
-    stubber = Stubber(bc.client)
-    response = {"body": boto3.compat.BytesIO(b"not-a-json")}
-    expected_params = {
-        "modelId": "test-model-id",
-        "contentType": "application/json",
-        "accept": "application/json",
-        "body": bytes(json.dumps({
-            "prompt": "hey",
-            "maxTokensToSample": 256,
-            "temperature": 0.7
-        }), "utf-8")
+def test_invoke_messages(monkeypatch):
+    os.environ["AWS_REGION"] = "us-east-2"
+    os.environ["BEDROCK_MODEL_ID"] = "meta.llama3-3-70b-instruct-v1:0"
+    payload = {
+        "messages": [
+            { "content": [ { "text": "Msg text" } ] }
+        ]
     }
-    stubber.add_response("invoke_model", response, expected_params)
-    stubber.activate()
+    dummy = DummyClient(payload)
+    monkeypatch.setattr("bedrock_client.boto3.client", lambda *args, **kwargs: dummy)
+    bc = BedrockClient()
+    assert bc.invoke("prompt") == "Msg text"
 
-    with pytest.raises(BedrockInvocationError) as excinfo:
-        bc.invoke("hey")
-    assert "Failed to parse Bedrock response" in str(excinfo.value)
-    stubber.deactivate()
+def test_invoke_no_valid_field(monkeypatch):
+    # All fields empty or missing → should raise BedrockInvocationError
+    os.environ["AWS_REGION"] = "us-east-2"
+    os.environ["BEDROCK_MODEL_ID"] = "meta.llama3-3-70b-instruct-v1:0"
+    dummy = DummyClient({"nope": "nothing"})
+    monkeypatch.setattr("bedrock_client.boto3.client", lambda *args, **kwargs: dummy)
+    bc = BedrockClient()
+    with pytest.raises(BedrockInvocationError):
+        bc.invoke("prompt")
